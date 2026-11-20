@@ -65,7 +65,8 @@ jobs:
           docker run --rm --network host -v "$PWD/db/migrations:/flyway/sql:ro" "$FLYWAY_IMAGE"
           -url=jdbc:postgresql://localhost:5432/supplychain_test -user=supplychain
           -password=supplychain -outOfOrder=true
-          -placeholders.forecast_db_password=ci-only-password migrate
+          -placeholders.forecast_db_password=ci-only-password
+          -placeholders.grafana_db_password=ci-only-password migrate
       - name: Unit and integration tests
         run: pytest -m "" -p no:cacheprovider --junitxml=reports/python-tests.xml -rA
       - name: Upload test report
@@ -99,7 +100,8 @@ jobs:
             docker run --rm --network host -v "$PWD/db/migrations:/flyway/sql:ro" "$FLYWAY_IMAGE" \
               -url=jdbc:postgresql://localhost:5432/supplychain -user=supplychain \
               -password=supplychain -outOfOrder=true \
-              -placeholders.forecast_db_password=ci-only-password "$command"
+              -placeholders.forecast_db_password=ci-only-password \
+              -placeholders.grafana_db_password=ci-only-password "$command"
           done
 
   # Platform API (Teammate C); skipped until services/platform-api is on the branch.

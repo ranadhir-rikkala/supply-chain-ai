@@ -27,6 +27,7 @@ services:
       FLYWAY_PASSWORD: ${POSTGRES_PASSWORD:-supplychain}
       FLYWAY_LOCATIONS: filesystem:/flyway/sql
       FLYWAY_PLACEHOLDERS_FORECAST_DB_PASSWORD: ${FORECAST_DB_PASSWORD:-forecast-local-only}
+      FLYWAY_PLACEHOLDERS_GRAFANA_DB_PASSWORD: ${GRAFANA_DB_PASSWORD:-grafana-local-only}
     volumes:
       - ./db/migrations:/flyway/sql:ro
     depends_on:
@@ -43,6 +44,7 @@ services:
       RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-supplychain}
     volumes:
       - rabbitmq_data:/var/lib/rabbitmq
+      - ./monitoring/rabbitmq/enabled_plugins:/etc/rabbitmq/enabled_plugins:ro
     healthcheck:
       test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
       interval: 5s
@@ -139,8 +141,62 @@ services:
     tmpfs:
       - /tmp
     restart: unless-stopped
+  prometheus:
+    image: prom/prometheus:v3.1.0
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=15d
+      - --web.enable-lifecycle
+    ports:
+      - "127.0.0.1:9090:9090"
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:9090/-/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+    restart: unless-stopped
+  grafana:
+    image: grafana/grafana:11.4.0
+    entrypoint: ["sh", "-c", "test -n \"$$GF_SECURITY_ADMIN_PASSWORD\" || { echo 'GRAFANA_ADMIN_PASSWORD must be set in .env' >&2; exit 1; }; exec /run.sh"]
+    environment:
+      GF_SERVER_ROOT_URL: ${PUBLIC_URL:-https://localhost}/grafana/
+      GF_SERVER_SERVE_FROM_SUB_PATH: "true"
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-}
+      GF_SECURITY_COOKIE_SECURE: "true"
+      GF_SECURITY_DISABLE_GRAVATAR: "true"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/supply-chain.json
+      POSTGRES_DB: ${POSTGRES_DB:-supplychain}
+      GRAFANA_DB_PASSWORD: ${GRAFANA_DB_PASSWORD:-grafana-local-only}
+    ports:
+      - "127.0.0.1:3000:3000"
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:3000/grafana/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+    depends_on:
+      prometheus:
+        condition: service_started
+      flyway:
+        condition: service_completed_successfully
+    restart: unless-stopped
 volumes:
   postgres_data:
   rabbitmq_data:
+  prometheus_data:
+  grafana_data:
   caddy_data:
   caddy_config:

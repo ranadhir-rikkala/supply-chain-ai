@@ -1,0 +1,45 @@
+# Prometheus scrape configuration for every service in compose.yaml (Teammate B).
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  # Spring Boot Actuator endpoint; shows as down until the platform API is running.
+  - job_name: platform-api
+    metrics_path: /actuator/prometheus
+    static_configs:
+      - targets: ["platform-api:8080"]
+
+  - job_name: forecast-api
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["forecast-api:8000"]
+
+  - job_name: forecast-worker
+    static_configs:
+      - targets: ["forecast-worker:9100"]
+
+  # DNS discovery finds both etl-worker replicas behind the one service name.
+  - job_name: etl-worker
+    dns_sd_configs:
+      - names: ["etl-worker"]
+        type: A
+        port: 9100
+        refresh_interval: 30s
+
+  - job_name: rabbitmq
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["rabbitmq:15692"]
+
+  # Per-queue depth and consumer counts, which the aggregated /metrics endpoint does not include.
+  - job_name: rabbitmq-queues
+    metrics_path: /metrics/detailed
+    params:
+      family: ["queue_coarse_metrics", "queue_consumer_count"]
+    static_configs:
+      - targets: ["rabbitmq:15692"]

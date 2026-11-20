@@ -1,0 +1,11 @@
+# Loads the dashboard JSON files from disk; UI edits are disabled so the files stay the source of truth.
+apiVersion: 1
+
+providers:
+  - name: supply-chain
+    folder: Supply chain
+    type: file
+    disableDeletion: true
+    allowUiUpdates: false
+    options:
+      path: /var/lib/grafana/dashboards

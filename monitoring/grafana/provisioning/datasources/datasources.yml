@@ -1,0 +1,29 @@
+# Datasources are provisioned from this file, so nobody configures Grafana by hand.
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    uid: prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
+    jsonData:
+      timeInterval: 15s
+
+  - name: Supply chain Postgres
+    uid: postgres
+    type: grafana-postgresql-datasource
+    access: proxy
+    url: postgres:5432
+    # Read-only role from V13; the password comes from the environment, not from git.
+    user: grafana_reader
+    editable: false
+    jsonData:
+      database: ${POSTGRES_DB}
+      sslmode: disable
+      postgresVersion: 1600
+      maxOpenConns: 4
+    secureJsonData:
+      password: ${GRAFANA_DB_PASSWORD}
