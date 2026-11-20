@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import signal
 from collections.abc import Callable
@@ -33,6 +34,9 @@ MESSAGES_POISON = Counter("scdata_messages_poison_total", "Malformed messages se
 CONSUMER_READY = Gauge("scdata_consumer_ready", "Whether the consumer is connected")
 
 
+logger = logging.getLogger(__name__)
+
+
 class PoisonMessage(ValueError):
     """A message that cannot safely be retried, such as invalid JSON."""
 
@@ -50,33 +54,47 @@ class FeedConsumer:
         callback: Callable[[dict], None],
         url: str | None = None,
         metrics_port: int | None = None,
+        *,
+        exchange: str = "erp",
+        queue: str = "etl.feed",
+        routing_key: str = "feed",
+        required_field: str = "file_key",
+        max_attempts: int = 4,
+        on_dead_letter: Callable[[dict | None, str], None] | None = None,
     ):
         import pika
 
         self.pika = pika
         self.callback = callback
         self.stopping = False
+        self.queue = queue
+        self.retry_queue = f"{queue}.retry"
+        self.dead_letter_queue = f"{queue}.dlq"
+        self.required_field = required_field
+        self.max_attempts = max_attempts
+        self.on_dead_letter = on_dead_letter
         self.connection = pika.BlockingConnection(
             pika.URLParameters(
-                url or os.getenv("RABBITMQ_URL", "amqp://supplychain:supplychain@localhost:5672/")
+                url
+                or os.getenv("AMQP_URL")
+                or os.getenv("RABBITMQ_URL", "amqp://supplychain:supplychain@localhost:5672/")
             )
         )
         self.channel = self.connection.channel()
-        self.channel.exchange_declare(exchange="erp", exchange_type="topic", durable=True)
-        self.channel.queue_declare(queue="etl.feed", durable=True)
-        self.channel.queue_bind(queue="etl.feed", exchange="erp", routing_key="feed.#")
+        self.channel.exchange_declare(exchange=exchange, exchange_type="topic", durable=True)
+        self.channel.queue_declare(queue=queue, durable=True)
+        self.channel.queue_bind(queue=queue, exchange=exchange, routing_key=f"{routing_key}.#")
         self.channel.queue_declare(
-            queue="etl.feed.retry",
+            queue=self.retry_queue,
             durable=True,
-            arguments={"x-dead-letter-exchange": "erp", "x-dead-letter-routing-key": "feed"},
+            arguments={
+                "x-dead-letter-exchange": exchange,
+                "x-dead-letter-routing-key": routing_key,
+            },
         )
-        self.channel.queue_bind(queue="etl.feed.retry", exchange="erp", routing_key="feed.retry")
-        self.channel.queue_declare(queue="etl.feed.dlq", durable=True)
-        self.channel.queue_bind(queue="etl.feed.dlq", exchange="erp", routing_key="feed.dlq")
+        self.channel.queue_declare(queue=self.dead_letter_queue, durable=True)
         self.channel.basic_qos(prefetch_count=1)
-        self.channel.basic_consume(
-            queue="etl.feed", on_message_callback=self._consume, auto_ack=False
-        )
+        self.channel.basic_consume(queue=queue, on_message_callback=self._consume, auto_ack=False)
         signal.signal(signal.SIGTERM, self._shutdown)
         signal.signal(signal.SIGINT, self._shutdown)
         start_http_server(metrics_port or int(os.getenv("METRICS_PORT", "9100")))
@@ -88,22 +106,30 @@ class FeedConsumer:
         if self.connection.is_open:
             self.connection.add_callback_threadsafe(self.channel.stop_consuming)
 
-    def _publish_dlq(self, body: bytes, headers: dict, reason: str) -> None:
+    def _publish_dlq(self, body: bytes, headers: dict, reason: str, message: dict | None) -> None:
         headers = {**headers, "x-failure-reason": reason}
         self.channel.basic_publish(
-            "erp", "feed.dlq", body, self.pika.BasicProperties(delivery_mode=2, headers=headers)
+            "",
+            self.dead_letter_queue,
+            body,
+            self.pika.BasicProperties(delivery_mode=2, headers=headers),
         )
         MESSAGES_FAILED.inc()
+        if self.on_dead_letter:
+            try:
+                self.on_dead_letter(message, reason)
+            except Exception:
+                logger.exception("dead-letter callback failed")
 
     def _consume(self, channel, method, properties, body) -> None:
         headers = properties.headers or {}
         try:
             message = json.loads(body)
-            if not isinstance(message, dict) or not message.get("file_key"):
-                raise PoisonMessage("message must be an object with file_key")
+            if not isinstance(message, dict) or not message.get(self.required_field):
+                raise PoisonMessage(f"message must be an object with {self.required_field}")
         except (json.JSONDecodeError, UnicodeDecodeError, PoisonMessage, TypeError) as error:
             channel.basic_ack(method.delivery_tag)
-            self._publish_dlq(body, headers, f"POISON:{error}")
+            self._publish_dlq(body, headers, f"POISON:{error}", None)
             MESSAGES_POISON.inc()
             return
         try:
@@ -113,14 +139,16 @@ class FeedConsumer:
         except Exception as error:  # noqa: BLE001 - all worker failures are retryable until the attempt limit
             attempt = int(headers.get("x-attempts", 0)) + 1
             channel.basic_ack(method.delivery_tag)
-            if attempt >= 4:
-                self._publish_dlq(body, {**headers, "x-attempts": attempt}, f"WORKER:{error}")
+            if attempt >= self.max_attempts:
+                self._publish_dlq(
+                    body, {**headers, "x-attempts": attempt}, f"WORKER:{error}", message
+                )
             else:
                 delay_ms = 1000 * (2 ** (attempt - 1))
                 retry_headers = {**headers, "x-attempts": attempt}
                 channel.basic_publish(
-                    "erp",
-                    "feed.retry",
+                    "",
+                    self.retry_queue,
                     body,
                     self.pika.BasicProperties(
                         delivery_mode=2, expiration=str(delay_ms), headers=retry_headers

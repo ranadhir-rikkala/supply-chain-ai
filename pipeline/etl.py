@@ -120,6 +120,7 @@ def _load_with_copy(db, kind: str, rows: list[dict], run_id: str) -> None:
             "warehouse_id",
             "units_sold",
             "unit_price",
+            "promo_flag",
             "etl_run_id",
         ]
         values = [
@@ -130,12 +131,13 @@ def _load_with_copy(db, kind: str, rows: list[dict], run_id: str) -> None:
                 r["warehouse_id"],
                 int(r["units_sold"]),
                 r["unit_price"],
+                int(r["promotion"]) == 1,
                 run_id,
             )
             for r in rows
         ]
         target, temp = "core.fact_sales_daily", "tmp_sales_daily"
-        types = "feed_date date, sale_id text, sku text, warehouse_id text, units_sold int, unit_price numeric, etl_run_id uuid"
+        types = "feed_date date, sale_id text, sku text, warehouse_id text, units_sold int, unit_price numeric, promo_flag boolean, etl_run_id uuid"
     elif kind == "inventory":
         columns = [
             "feed_date",
@@ -210,6 +212,7 @@ def _load_with_copy(db, kind: str, rows: list[dict], run_id: str) -> None:
         target, temp = "core.fact_receipt", "tmp_receipt"
         types = "receipt_id text, po_id text, receipt_date date, quantity int, warehouse_id text, etl_run_id uuid"
     with db.cursor() as cur:
+        cur.execute(f"DROP TABLE IF EXISTS {temp}")
         cur.execute(f"CREATE TEMP TABLE {temp} ({types}) ON COMMIT DROP")
         with cur.copy(f"COPY {temp} ({','.join(columns)}) FROM STDIN") as copy:
             for value in values:
@@ -221,6 +224,16 @@ def _load_with_copy(db, kind: str, rows: list[dict], run_id: str) -> None:
 
 def _db_catalog(db, root: Path) -> None:
     for filename, table, columns in [
+        (
+            "suppliers.csv",
+            "core.dim_supplier",
+            ["supplier_id", "supplier_name", "region", "lead_time_mean", "lead_time_sd"],
+        ),
+        (
+            "warehouses.csv",
+            "core.dim_warehouse",
+            ["warehouse_id", "warehouse_name", "city", "latitude", "longitude", "climate_scale"],
+        ),
         (
             "products.csv",
             "core.dim_product",
@@ -234,21 +247,11 @@ def _db_catalog(db, root: Path) -> None:
                 "unit_price",
             ],
         ),
-        (
-            "suppliers.csv",
-            "core.dim_supplier",
-            ["supplier_id", "supplier_name", "region", "lead_time_mean", "lead_time_sd"],
-        ),
-        (
-            "warehouses.csv",
-            "core.dim_warehouse",
-            ["warehouse_id", "warehouse_name", "city", "latitude", "longitude", "climate_scale"],
-        ),
     ]:
         with (root / "catalog" / filename).open(newline="") as handle:
             rows = list(csv.DictReader(handle))
         placeholders = ",".join(["%s"] * len(columns))
-        db.executemany(
+        db.cursor().executemany(
             f"INSERT INTO {table} ({','.join(columns)}) VALUES ({placeholders}) ON CONFLICT DO NOTHING",
             [tuple(row[column] for column in columns) for row in rows],
         )
@@ -346,6 +349,8 @@ def load_master(
                 results["skipped"] += 1
                 continue
             good, bad_rows, _ = _load_one(path, root_path, manifest, known, run_id, db)
+            if db:
+                db.commit()
             results["files"] += 1
             results["good_rows"] += good
             results["bad_rows"] += len(bad_rows)
@@ -403,7 +408,7 @@ def load_eval(root: str, database_url: str | None = None) -> dict:
         import psycopg
 
         with psycopg.connect(database_url or os.environ["DATABASE_URL"]) as db:
-            db.executemany(
+            db.cursor().executemany(
                 "INSERT INTO eval.planted_defect (defect_id,file_key,line_number,defect_type,expected_reason) VALUES (%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING",
                 [
                     (
@@ -416,7 +421,7 @@ def load_eval(root: str, database_url: str | None = None) -> dict:
                     for x in defects
                 ],
             )
-            db.executemany(
+            db.cursor().executemany(
                 "INSERT INTO eval.disruption_truth (disruption_id,disruption_type,start_date,end_date,description,supplier_id,sku,warehouse_id) VALUES (%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING",
                 [
                     (

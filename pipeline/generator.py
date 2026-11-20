@@ -6,7 +6,9 @@ import gzip
 import hashlib
 import io
 import json
+import math
 import random
+from collections import deque
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -45,6 +47,73 @@ SUPPLIER_REGIONS = [
     ("MEXICO", 8, 14),
     ("CHINA", 30, 45),
 ]
+
+CATEGORY_BASE_DEMAND = {
+    "BEV": 30.0,
+    "SNK": 24.0,
+    "DAI": 20.0,
+    "FRZ": 14.0,
+    "PCR": 12.0,
+    "HHC": 8.0,
+    "PAP": 16.0,
+    "ELE": 6.0,
+    "PHA": 10.0,
+    "OUT": 7.0,
+    "WIN": 6.0,
+    "SCH": 9.0,
+}
+CATEGORY_SEASON = {
+    "BEV": (0.30, 196, "summer"),
+    "SNK": (0.08, 200, None),
+    "DAI": (0.05, 30, None),
+    "FRZ": (0.25, 205, "summer"),
+    "PCR": (0.04, 30, None),
+    "HHC": (0.10, 340, None),
+    "PAP": (0.05, 20, None),
+    "ELE": (0.08, 350, None),
+    "PHA": (0.22, 15, "winter"),
+    "OUT": (0.50, 175, "summer"),
+    "WIN": (0.65, 10, "winter"),
+    "SCH": (0.10, 240, None),
+}
+WEEKDAY_FACTORS = (0.92, 0.90, 0.93, 0.98, 1.08, 1.18, 1.01)
+YEARLY_GROWTH = 0.06
+DEMAND_SHAPE = 6.0
+PROMO_WEEKLY_PROBABILITY = 0.06
+PROMO_LIFT = 1.30
+PROMO_DISCOUNT = 0.15
+SAFETY_DAYS = 4
+REVIEW_DAYS = 7
+LATE_DELIVERY_PROBABILITY = 0.12
+DISRUPTION_DAYS = {
+    "SUPPLIER_DELAY": 14,
+    "PORT_CLOSURE": 10,
+    "HEAT_WAVE": 7,
+    "COLD_SNAP": 7,
+    "PANIC_BUYING": 5,
+    "VIRAL_PRODUCT": 21,
+}
+SUPPLY_DELAY_DAYS = {"SUPPLIER_DELAY": 10, "PORT_CLOSURE": 14}
+DEMAND_SHOCKS = {
+    "HEAT_WAVE": ({"BEV", "FRZ", "OUT"}, 1.8),
+    "COLD_SNAP": ({"WIN", "PHA"}, 1.8),
+    "PANIC_BUYING": ({"PAP", "PCR", "PHA", "DAI"}, 2.2),
+}
+VIRAL_LIFT = 3.5
+WEST_COAST_CITIES = ("Los Angeles", "Seattle")
+OCEAN_REGION = "CHINA"
+PO_EVENT_FIELDS = [
+    "event_id",
+    "po_id",
+    "event_type",
+    "event_time",
+    "supplier_id",
+    "warehouse_id",
+    "sku",
+    "quantity",
+    "eta",
+]
+RECEIPT_FIELDS = ["receipt_id", "po_id", "receipt_date", "quantity", "warehouse_id"]
 
 
 def _csv_bytes(rows: list[dict], fields: list[str], gz: bool = True) -> bytes:
@@ -127,26 +196,102 @@ def _disruptions(start: date, end: date) -> list[dict]:
                 "disruption_id": f"DIS-{i + 1:03d}",
                 "disruption_type": kind,
                 "start_date": event_date.isoformat(),
-                "end_date": (event_date + timedelta(days=3)).isoformat(),
+                "end_date": (event_date + timedelta(days=DISRUPTION_DAYS[kind] - 1)).isoformat(),
                 "description": f"Planted {kind.lower().replace('_', ' ')} event",
             }
         )
     return rows
 
 
-def _seasonal_multiplier(
-    day: date, category: str, warehouse: dict, rng: random.Random
-) -> tuple[float, bool]:
-    value = 1.0 + 0.00025 * (day - date(2023, 1, 1)).days
-    value += 0.12 if day.weekday() >= 5 else -0.05
-    value += 0.35 if day.month in (6, 7) else 0
-    value += 0.30 if day.month == 12 else 0
-    value += 0.25 if day.month == 8 and category == "SCH" else 0
-    value += 0.30 if day.month == 9 and category == "ELE" else 0
-    value += 0.25 if day.month == 11 and day.day >= 20 else 0
-    climate = warehouse["summer_scale"] if day.month in (6, 7, 8) else warehouse["winter_scale"]
-    promo = rng.random() < 0.08
-    return value * climate * (1.25 if promo else 1.0), promo
+def black_friday(year: int) -> date:
+    first_of_november = date(year, 11, 1)
+    first_thursday = first_of_november + timedelta(days=(3 - first_of_november.weekday()) % 7)
+    return first_thursday + timedelta(days=22)
+
+
+def demand_multiplier(day: date, category: str, warehouse: dict) -> float:
+    amplitude, peak_day, climate = CATEGORY_SEASON[category]
+    if climate == "summer":
+        amplitude *= warehouse["summer_scale"]
+    elif climate == "winter":
+        amplitude *= warehouse["winter_scale"]
+    day_of_year = day.timetuple().tm_yday
+    value = 1.0 + amplitude * math.cos(2 * math.pi * (day_of_year - peak_day) / 365.25)
+    value *= (1.0 + YEARLY_GROWTH) ** ((day - date(2023, 1, 1)).days / 365.25)
+    value *= WEEKDAY_FACTORS[day.weekday()]
+    days_after_black_friday = (day - black_friday(day.year)).days
+    if 0 <= days_after_black_friday <= 3:
+        value *= 2.5 if category == "ELE" else 1.4
+    if day.month == 12 and day.day <= 24:
+        value *= 1.35 if category in ("ELE", "HHC", "WIN") else 1.12
+    if category == "SCH" and date(day.year, 7, 25) <= day <= date(day.year, 9, 7):
+        value *= 2.2
+    if category == "ELE" and date(day.year, 9, 12) <= day <= date(day.year, 9, 30):
+        value *= 1.6
+    return value
+
+
+def _assign_disruption_targets(
+    disruptions: list[dict],
+    products: list[dict],
+    suppliers: list[dict],
+    warehouses: list[dict],
+    rng,
+) -> None:
+    ocean_suppliers = [s for s in suppliers if s["region"] == OCEAN_REGION]
+    west_coast = [w for w in warehouses if w["city"] in WEST_COAST_CITIES]
+    for disruption in disruptions:
+        kind = disruption["disruption_type"]
+        supplier_pool = ocean_suppliers if kind == "PORT_CLOSURE" else suppliers
+        warehouse_pool = west_coast if kind == "PORT_CLOSURE" else warehouses
+        disruption.update(
+            {
+                "supplier_id": supplier_pool[rng.randrange(len(supplier_pool))]["supplier_id"],
+                "sku": products[rng.randrange(len(products))]["sku"],
+                "warehouse_id": warehouse_pool[rng.randrange(len(warehouse_pool))]["warehouse_id"],
+            }
+        )
+
+
+def _demand_shock(product: dict, warehouse_id: str, active: list[dict]) -> float:
+    shock = 1.0
+    for disruption in active:
+        kind = disruption["disruption_type"]
+        if kind == "VIRAL_PRODUCT" and disruption["sku"] == product["sku"]:
+            shock *= VIRAL_LIFT
+        elif kind in DEMAND_SHOCKS and disruption["warehouse_id"] == warehouse_id:
+            categories, lift = DEMAND_SHOCKS[kind]
+            if product["category"] in categories:
+                shock *= lift
+    return shock
+
+
+def _supply_delay(supplier: dict, warehouse_id: str, active: list[dict]) -> int:
+    delay = 0
+    for disruption in active:
+        kind = disruption["disruption_type"]
+        if kind not in SUPPLY_DELAY_DAYS:
+            continue
+        if kind == "SUPPLIER_DELAY" and disruption["supplier_id"] == supplier["supplier_id"]:
+            delay = max(delay, SUPPLY_DELAY_DAYS[kind])
+        if (
+            kind == "PORT_CLOSURE"
+            and supplier["region"] == OCEAN_REGION
+            and disruption["warehouse_id"] == warehouse_id
+        ):
+            delay = max(delay, SUPPLY_DELAY_DAYS[kind])
+    return delay
+
+
+def _affected_by(disruption: dict, order: dict, suppliers_by_id: dict[str, dict]) -> bool:
+    if disruption["disruption_type"] == "SUPPLIER_DELAY":
+        return order["supplier_id"] == disruption["supplier_id"]
+    if disruption["disruption_type"] == "PORT_CLOSURE":
+        return (
+            suppliers_by_id[order["supplier_id"]]["region"] == OCEAN_REGION
+            and order["warehouse_id"] == disruption["warehouse_id"]
+        )
+    return False
 
 
 def _plant_row_defects(rows: list[dict], kind: str, file_key: str, planted: list[dict]) -> None:
@@ -189,152 +334,168 @@ def generate(root: str | Path, start: date, end: date, seed: int = SEED) -> dict
     store.put("catalog/suppliers.csv", _csv_bytes(suppliers, list(suppliers[0]), False))
     store.put("catalog/warehouses.csv", _csv_bytes(warehouses, list(warehouses[0]), False))
     disruptions = _disruptions(start, end)
-    for disruption in disruptions:
-        disruption.update(
-            {
-                "supplier_id": suppliers[rng.randrange(len(suppliers))]["supplier_id"],
-                "sku": products[rng.randrange(len(products))]["sku"],
-                "warehouse_id": warehouses[rng.randrange(len(warehouses))]["warehouse_id"],
-            }
-        )
+    _assign_disruption_targets(disruptions, products, suppliers, warehouses, rng)
+    suppliers_by_id = {supplier["supplier_id"]: supplier for supplier in suppliers}
+    warehouse_size = {w["warehouse_id"]: rng.uniform(0.7, 1.3) for w in warehouses}
+    cells = []
+    for warehouse in warehouses:
+        for product in products:
+            base = (
+                CATEGORY_BASE_DEMAND[product["category"]]
+                * rng.lognormvariate(0.0, 0.5)
+                * warehouse_size[warehouse["warehouse_id"]]
+            )
+            supplier = suppliers_by_id[product["supplier_id"]]
+            cover_days = supplier["lead_time_mean"] + SAFETY_DAYS + REVIEW_DAYS
+            cells.append(
+                {
+                    "warehouse": warehouse,
+                    "product": product,
+                    "supplier": supplier,
+                    "base": base,
+                    "on_hand": int(base * cover_days),
+                    "open_orders": [],
+                    "recent_sales": deque(maxlen=28),
+                    "promo": False,
+                }
+            )
     planted, manifest = [], []
-    history: dict[tuple[str, str], list[int]] = {}
-    inventory_state: dict[tuple[str, str], dict[str, int]] = {}
-    pipeline: dict[tuple[str, str], list[tuple[date, int]]] = {}
+    open_orders_by_id: dict[str, dict] = {}
+    po_sequence = 0
     day = start
     day_index = 0
     total_days = (end - start).days + 1
     while day <= end:
         datestr = day.isoformat()
         sales, inventory, events, receipts = [], [], [], []
-        for warehouse in warehouses:
-            for product in products:
-                multiplier, promo = _seasonal_multiplier(day, product["category"], warehouse, rng)
-                history_key = (warehouse["warehouse_id"], product["sku"])
-                state = inventory_state.setdefault(history_key, {"on_hand": 45, "on_order": 0})
-                arrivals = pipeline.pop(history_key, [])
-                for arrival_date, quantity in arrivals:
-                    if arrival_date <= day:
-                        state["on_hand"] += quantity
-                        state["on_order"] = max(0, state["on_order"] - quantity)
-                    else:
-                        pipeline.setdefault(history_key, []).append((arrival_date, quantity))
-                moving_average = sum(history.get(history_key, [])[-28:]) / max(
-                    1, len(history.get(history_key, []))
-                )
-                scale = (
-                    max(0.25, (moving_average / 4) * multiplier)
-                    if moving_average
-                    else max(0.25, multiplier)
-                )
-                potential_demand = max(0, int(rng.gammavariate(4.0, scale)))
-                demand = min(potential_demand, state["on_hand"])
-                stockout = demand < potential_demand
-                history.setdefault(history_key, []).append(potential_demand)
-                sid = f"S-{datestr}-{warehouse['warehouse_id']}-{product['sku']}"
-                iid = f"I-{datestr}-{warehouse['warehouse_id']}-{product['sku']}"
-                reorder_point = max(1, int(moving_average * 1.35))
-                state["on_hand"] = max(0, state["on_hand"] - demand)
-                sales.append(
-                    {
-                        "feed_date": datestr,
-                        "sale_id": sid,
-                        "sku": product["sku"],
-                        "warehouse_id": warehouse["warehouse_id"],
-                        "units_sold": demand,
-                        "unit_price": product["unit_price"],
-                        "promotion": int(promo),
-                    }
-                )
-                inventory.append(
-                    {
-                        "feed_date": datestr,
-                        "inventory_id": iid,
-                        "sku": product["sku"],
-                        "warehouse_id": warehouse["warehouse_id"],
-                        "on_hand": state["on_hand"],
-                        "on_order": state["on_order"],
-                        "reorder_point": reorder_point,
-                        "stockout_flag": stockout,
-                    }
-                )
-        inventory_rows = {(row["warehouse_id"], row["sku"]): row for row in inventory}
-        for i in range(200):
-            product, warehouse, supplier = (
-                products[rng.randrange(len(products))],
-                warehouses[rng.randrange(len(warehouses))],
-                suppliers[rng.randrange(len(suppliers))],
+        active = [d for d in disruptions if d["start_date"] <= datestr <= d["end_date"]]
+        for disruption in disruptions:
+            if disruption["start_date"] != datestr or disruption["disruption_type"] not in (
+                SUPPLY_DELAY_DAYS
+            ):
+                continue
+            delay = SUPPLY_DELAY_DAYS[disruption["disruption_type"]]
+            for order in open_orders_by_id.values():
+                if order["arrival"] > day and _affected_by(disruption, order, suppliers_by_id):
+                    order["arrival"] += timedelta(days=delay)
+                    events.append(
+                        {
+                            "event_id": f"ETA-{order['po_id']}-{datestr}",
+                            "po_id": order["po_id"],
+                            "event_type": "ETA_UPDATED",
+                            "event_time": f"{datestr}T12:00:00Z",
+                            "supplier_id": order["supplier_id"],
+                            "warehouse_id": order["warehouse_id"],
+                            "sku": order["sku"],
+                            "quantity": order["quantity"],
+                            "eta": order["arrival"].isoformat(),
+                        }
+                    )
+        for cell in cells:
+            warehouse, product, supplier = cell["warehouse"], cell["product"], cell["supplier"]
+            still_open = []
+            for order in cell["open_orders"]:
+                if order["arrival"] <= day:
+                    cell["on_hand"] += order["quantity"]
+                    open_orders_by_id.pop(order["po_id"], None)
+                    receipts.append(
+                        {
+                            "receipt_id": f"RC-{order['po_id']}",
+                            "po_id": order["po_id"],
+                            "receipt_date": datestr,
+                            "quantity": order["quantity"],
+                            "warehouse_id": order["warehouse_id"],
+                        }
+                    )
+                else:
+                    still_open.append(order)
+            cell["open_orders"] = still_open
+            if day.weekday() == 0 or day_index == 0:
+                cell["promo"] = rng.random() < PROMO_WEEKLY_PROBABILITY
+            mean_demand = (
+                cell["base"]
+                * demand_multiplier(day, product["category"], warehouse)
+                * (PROMO_LIFT if cell["promo"] else 1.0)
+                * _demand_shock(product, warehouse["warehouse_id"], active)
             )
-            po = f"PO-{datestr}-{day_index:04d}-{i}"
-            lead_time = max(1, int(rng.gauss(supplier["lead_time_mean"], supplier["lead_time_sd"])))
-            if rng.random() < 0.12:
-                lead_time += rng.randint(2, 10)
-            disruption = next(
-                (
-                    d
-                    for d in disruptions
-                    if d["start_date"] == datestr and d["supplier_id"] == supplier["supplier_id"]
-                ),
-                None,
+            potential_demand = round(rng.gammavariate(DEMAND_SHAPE, mean_demand / DEMAND_SHAPE))
+            sold = min(potential_demand, cell["on_hand"])
+            stockout = sold < potential_demand
+            cell["on_hand"] -= sold
+            cell["recent_sales"].append(sold)
+            moving_average = (
+                sum(cell["recent_sales"]) / len(cell["recent_sales"])
+                if len(cell["recent_sales"]) >= 7
+                else cell["base"]
             )
-            if disruption:
-                product = next(p for p in products if p["sku"] == disruption["sku"])
-                warehouse = next(
-                    w for w in warehouses if w["warehouse_id"] == disruption["warehouse_id"]
-                )
-                lead_time += 7
-            quantity = max(product["case_pack"], int(rng.gauss(50, 18)) * product["case_pack"])
-            arrival_date = day + timedelta(days=lead_time)
-            events.append(
-                {
-                    "event_id": f"EV-{po}",
-                    "po_id": po,
-                    "event_type": "CREATED",
-                    "event_time": f"{datestr}T08:00:00Z",
+            lead_mean = supplier["lead_time_mean"]
+            reorder_point = max(1, math.ceil(moving_average * (lead_mean + SAFETY_DAYS)))
+            order_up_to = moving_average * (lead_mean + SAFETY_DAYS + REVIEW_DAYS)
+            on_order = sum(order["quantity"] for order in cell["open_orders"])
+            if cell["on_hand"] + on_order <= reorder_point:
+                case_pack = product["case_pack"]
+                needed = max(case_pack, order_up_to - cell["on_hand"] - on_order)
+                quantity = math.ceil(needed / case_pack) * case_pack
+                lead_time = max(1, round(rng.gauss(lead_mean, supplier["lead_time_sd"])))
+                if rng.random() < LATE_DELIVERY_PROBABILITY:
+                    lead_time += rng.randint(2, 10)
+                lead_time += _supply_delay(supplier, warehouse["warehouse_id"], active)
+                po_sequence += 1
+                order = {
+                    "po_id": f"PO-{po_sequence:07d}",
                     "supplier_id": supplier["supplier_id"],
                     "warehouse_id": warehouse["warehouse_id"],
                     "sku": product["sku"],
                     "quantity": quantity,
-                    "eta": arrival_date.isoformat(),
+                    "arrival": day + timedelta(days=lead_time),
                 }
-            )
-            if disruption and disruption["disruption_type"] in ("SUPPLIER_DELAY", "PORT_CLOSURE"):
+                cell["open_orders"].append(order)
+                open_orders_by_id[order["po_id"]] = order
+                on_order += quantity
                 events.append(
                     {
-                        **events[-1],
-                        "event_id": f"ETA-{po}",
-                        "event_type": "ETA_UPDATED",
-                        "event_time": f"{datestr}T12:00:00Z",
-                        "eta": arrival_date.isoformat(),
-                    }
-                )
-            state_key = (warehouse["warehouse_id"], product["sku"])
-            state = inventory_state.setdefault(state_key, {"on_hand": 45, "on_order": 0})
-            state["on_order"] += quantity
-            pipeline.setdefault(state_key, []).append((arrival_date, quantity))
-            if state_key in inventory_rows:
-                inventory_rows[state_key]["on_order"] = state["on_order"]
-            if rng.random() < 0.7:
-                receipts.append(
-                    {
-                        "receipt_id": f"RC-{po}",
-                        "po_id": po,
-                        "receipt_date": arrival_date.isoformat(),
+                        "event_id": f"EV-{order['po_id']}",
+                        "po_id": order["po_id"],
+                        "event_type": "CREATED",
+                        "event_time": f"{datestr}T08:00:00Z",
+                        "supplier_id": order["supplier_id"],
+                        "warehouse_id": order["warehouse_id"],
+                        "sku": order["sku"],
                         "quantity": quantity,
-                        "warehouse_id": warehouse["warehouse_id"],
+                        "eta": order["arrival"].isoformat(),
                     }
                 )
+            unit_price = float(product["unit_price"])
+            if cell["promo"]:
+                unit_price *= 1 - PROMO_DISCOUNT
+            sales.append(
+                {
+                    "feed_date": datestr,
+                    "sale_id": f"S-{datestr}-{warehouse['warehouse_id']}-{product['sku']}",
+                    "sku": product["sku"],
+                    "warehouse_id": warehouse["warehouse_id"],
+                    "units_sold": sold,
+                    "unit_price": f"{unit_price:.2f}",
+                    "promotion": int(cell["promo"]),
+                }
+            )
+            inventory.append(
+                {
+                    "feed_date": datestr,
+                    "inventory_id": f"I-{datestr}-{warehouse['warehouse_id']}-{product['sku']}",
+                    "sku": product["sku"],
+                    "warehouse_id": warehouse["warehouse_id"],
+                    "on_hand": cell["on_hand"],
+                    "on_order": on_order,
+                    "reorder_point": reorder_point,
+                    "stockout_flag": stockout,
+                }
+            )
         rows_by_kind = [
             ("sales", sales, list(sales[0])),
             ("inventory", inventory, list(inventory[0])),
-            ("po_events", events, list(events[0])),
-            (
-                "receipts",
-                receipts,
-                list(receipts[0])
-                if receipts
-                else ["receipt_id", "po_id", "receipt_date", "quantity", "warehouse_id"],
-            ),
+            ("po_events", events, PO_EVENT_FIELDS),
+            ("receipts", receipts, RECEIPT_FIELDS),
         ]
         if total_days > 2 and day_index in (total_days // 3, (2 * total_days) // 3):
             renamed_inventory = []
