@@ -1,0 +1,263 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  PYTHON_VERSION: "3.12"
+  NODE_VERSION: "22"
+  FLYWAY_IMAGE: flyway/flyway:10-alpine
+
+jobs:
+  # Lint plus every unit and integration test against real Postgres and RabbitMQ.
+  python:
+    name: Python lint and tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: supplychain_test
+          POSTGRES_USER: supplychain
+          POSTGRES_PASSWORD: supplychain
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U supplychain -d supplychain_test"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+      rabbitmq:
+        image: rabbitmq:3.13-management-alpine
+        env:
+          RABBITMQ_DEFAULT_USER: supplychain
+          RABBITMQ_DEFAULT_PASS: supplychain
+        ports: ["5672:5672"]
+        options: >-
+          --health-cmd "rabbitmq-diagnostics -q ping"
+          --health-interval 10s --health-timeout 10s --health-retries 20
+    env:
+      TEST_DATABASE_URL: postgresql://supplychain:supplychain@localhost:5432/supplychain_test
+      TEST_AMQP_URL: amqp://supplychain:supplychain@localhost:5672/
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - name: Install package
+        run: pip install -e ".[dev,forecast,service]"
+      - name: Ruff lint
+        run: ruff check .
+      - name: Ruff format
+        run: ruff format --check .
+      # Integration tests need the Flyway schema, so migrate the service database first.
+      - name: Migrate test database
+        run: >-
+          docker run --rm --network host -v "$PWD/db/migrations:/flyway/sql:ro" "$FLYWAY_IMAGE"
+          -url=jdbc:postgresql://localhost:5432/supplychain_test -user=supplychain
+          -password=supplychain -outOfOrder=true
+          -placeholders.forecast_db_password=ci-only-password migrate
+      - name: Unit and integration tests
+        run: pytest -m "" -p no:cacheprovider --junitxml=reports/python-tests.xml -rA
+      - name: Upload test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-test-report
+          path: reports/python-tests.xml
+
+  # Proves the full migration history applies to an empty database and still validates.
+  flyway:
+    name: Flyway migrate and validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: supplychain
+          POSTGRES_USER: supplychain
+          POSTGRES_PASSWORD: supplychain
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U supplychain -d supplychain"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Migrate and validate a clean database
+        run: |
+          for command in migrate validate info; do
+            docker run --rm --network host -v "$PWD/db/migrations:/flyway/sql:ro" "$FLYWAY_IMAGE" \
+              -url=jdbc:postgresql://localhost:5432/supplychain -user=supplychain \
+              -password=supplychain -outOfOrder=true \
+              -placeholders.forecast_db_password=ci-only-password "$command"
+          done
+
+  # Platform API (Teammate C); skipped until services/platform-api is on the branch.
+  java:
+    name: Platform API build and tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check for the platform API
+        id: present
+        run: |
+          if [ -f services/platform-api/pom.xml ]; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "services/platform-api is not on this branch yet; skipping" >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - uses: actions/setup-java@v4
+        if: steps.present.outputs.found == 'true'
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+      - name: Build and test with Testcontainers
+        if: steps.present.outputs.found == 'true'
+        working-directory: services/platform-api
+        run: |
+          if [ -x ./mvnw ]; then ./mvnw -B -ntp verify; else mvn -B -ntp verify; fi
+
+  dashboard:
+    name: Dashboard lint, test and build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: dashboard
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: dashboard/package-lock.json
+      - run: npm ci --no-audit --no-fund
+      - run: npm run lint
+      - run: npm test
+      - run: npm run build
+
+  # Monday checklist: block known-exploited Python flaws, critical npm flaws and committed secrets.
+  dependency-scan:
+    name: Dependency scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - name: Install package and pip-audit
+        run: pip install ".[forecast,service]" pip-audit
+      - name: Audit Python dependencies
+        run: pip-audit --skip-editable --progress-spinner off --format json --output pip-audit.json || true
+      - name: Fail on known-exploited Python vulnerabilities
+        run: python .github/scripts/kev_gate.py pip-audit.json
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - name: Audit dashboard dependencies
+        working-directory: dashboard
+        run: npm audit --omit=dev --audit-level=critical
+      - name: Scan repository with Trivy
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret
+          severity: CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+
+  # Builds every image after the tests pass; pushes to GHCR only from main, using GITHUB_TOKEN instead of stored keys.
+  images:
+    name: Docker image ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: [python, flyway, java, dashboard, dependency-scan]
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: forecast
+            context: .
+            dockerfile: infra/forecast/Dockerfile
+          - name: etl
+            context: .
+            dockerfile: infra/etl/Dockerfile
+          - name: caddy
+            context: dashboard
+            dockerfile: dashboard/Dockerfile
+          - name: platform-api
+            context: services/platform-api
+            dockerfile: services/platform-api/Dockerfile
+    env:
+      PUBLISH: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check for the Dockerfile
+        id: present
+        run: |
+          if [ -f "${{ matrix.dockerfile }}" ]; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "${{ matrix.dockerfile }} is not on this branch yet; skipping" >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Image name
+        if: steps.present.outputs.found == 'true'
+        id: image
+        run: |
+          owner="$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')"
+          echo "ref=ghcr.io/${owner}/supply-chain-ai-${{ matrix.name }}" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@v3
+        if: steps.present.outputs.found == 'true'
+      - name: Build image
+        if: steps.present.outputs.found == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          load: true
+          tags: |
+            ${{ steps.image.outputs.ref }}:${{ github.sha }}
+            ${{ steps.image.outputs.ref }}:latest
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
+      # Critical OS or library flaws with an available fix fail the build before anything is pushed.
+      - name: Scan image with Trivy
+        if: steps.present.outputs.found == 'true'
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ steps.image.outputs.ref }}:${{ github.sha }}
+          severity: CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+      - name: Log in to GHCR
+        if: steps.present.outputs.found == 'true' && env.PUBLISH == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Push image to GHCR
+        if: steps.present.outputs.found == 'true' && env.PUBLISH == 'true'
+        run: |
+          docker push "${{ steps.image.outputs.ref }}:${{ github.sha }}"
+          docker push "${{ steps.image.outputs.ref }}:latest"
