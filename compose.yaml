@@ -26,6 +26,7 @@ services:
       FLYWAY_USER: ${POSTGRES_USER:-supplychain}
       FLYWAY_PASSWORD: ${POSTGRES_PASSWORD:-supplychain}
       FLYWAY_LOCATIONS: filesystem:/flyway/sql
+      FLYWAY_PLACEHOLDERS_FORECAST_DB_PASSWORD: ${FORECAST_DB_PASSWORD:-forecast-local-only}
     volumes:
       - ./db/migrations:/flyway/sql:ro
     depends_on:
@@ -80,6 +81,64 @@ services:
       - caddy_config:/config
     restart: unless-stopped
 
+  forecast-api:
+    build:
+      context: .
+      dockerfile: infra/forecast/Dockerfile
+    image: supply-chain-ai/forecast:dev
+    command: ["scforecast", "serve", "--port", "8000"]
+    environment: &forecast-environment
+      DATABASE_URL: postgresql://forecast_service:${FORECAST_DB_PASSWORD:-forecast-local-only}@postgres:5432/${POSTGRES_DB:-supplychain}
+      AMQP_URL: amqp://${RABBITMQ_USER:-supplychain}:${RABBITMQ_PASSWORD:-supplychain}@rabbitmq:5672/
+      FORECAST_SERVICE_TOKEN: ${FORECAST_SERVICE_TOKEN:-}
+      STORE: ${STORE:-local}
+      LOCAL_STORE_ROOT: /data
+      S3_BUCKET: ${S3_BUCKET:-}
+      AWS_REGION: ${AWS_REGION:-us-east-2}
+      SERVICE_NAME: forecast-api
+    ports:
+      - "127.0.0.1:8001:8000"
+    volumes:
+      - ${DATA_ROOT:-./data}:/data:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/live', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+    depends_on:
+      flyway:
+        condition: service_completed_successfully
+      rabbitmq:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp
+    restart: unless-stopped
+  forecast-worker:
+    image: supply-chain-ai/forecast:dev
+    command: ["scforecast", "worker"]
+    environment:
+      <<: *forecast-environment
+      SERVICE_NAME: forecast-worker
+      METRICS_PORT: 9100
+    volumes:
+      - ${DATA_ROOT:-./data}:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9100/metrics', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+    depends_on:
+      forecast-api:
+        condition: service_started
+      flyway:
+        condition: service_completed_successfully
+      rabbitmq:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp
+    restart: unless-stopped
 volumes:
   postgres_data:
   rabbitmq_data:
